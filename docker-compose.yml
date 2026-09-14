@@ -20,11 +20,15 @@ services:
   # 一次性验收服务：默认 `docker compose up` 不会启动它（位于 verify profile）。
   # 运行 `docker compose --profile verify run --rm verify` 即可对在线 API 执行验收脚本，
   # 结束后容器自动退出并删除。
+  #
+  # 注意：构建入口只保留在 api 上。两个服务若同时声明 build 并指向同一镜像标签，
+  # Compose 会并行构建、争抢同名镜像而失败；因此这里只引用镜像并禁止拉取，
+  # 镜像由 depends_on 的 api（service_healthy）先行构建产出。
   verify:
     profiles:
       - verify
     image: runway-friction-api:latest
-    build: .
+    pull_policy: never
     depends_on:
       api:
         condition: service_healthy

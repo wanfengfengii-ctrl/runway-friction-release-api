@@ -155,11 +155,14 @@ docker compose down
 （`docker compose run --rm`，跑完即退出并自动删除容器）：
 
 ```bash
-docker compose --profile verify run --rm verify
+# 全新环境一条命令完成：构建镜像 → 启动 API 并等其健康 → 运行验收 → 退出清理
+docker compose --profile verify run --build --rm verify
 ```
 
-该服务通过 `depends_on: service_healthy` 等 API 健康后再执行，
-内部访问地址固定为 `http://api:8000`。对宿主机上已运行的实例也可直接执行：
+镜像只由 `api` 服务构建（`verify` 仅引用同一镜像并设 `pull_policy: never`），
+避免两个服务并行构建时争抢同名镜像标签；`verify` 通过
+`depends_on: service_healthy` 等 API 健康后才执行，容器内访问地址固定为
+`http://api:8000`。对宿主机上已运行的实例也可直接执行：
 
 ```bash
 BASE_URL=http://127.0.0.1:8000 python3 scripts/acceptance.py
