@@ -52,6 +52,19 @@ def median_of_three(values: list[float]) -> float:
     return statistics.median(values)
 
 
+def robust_median_of_five(values: list[float]) -> tuple[float, list[float], list[float]]:
+    """五点稳健采样：排序后各剔除一个最低值与最高值，取剩余三值的中位数。
+
+    返回 ``(中位数, 剔除值, 实际参与判定的三值)``。多个相同极值只按位置各剔除
+    一个，因此剔除值恒为排序后的首、尾元素，参与判定的三值即排序后的第 2–4 个。
+    前置条件：``values`` 恰好 5 个元素（由请求模型保证）。
+    """
+    ordered = sorted(values)
+    excluded = [ordered[0], ordered[-1]]
+    used = ordered[1:-1]
+    return statistics.median(used), excluded, used
+
+
 def worst_rating(ratings: list[Rating]) -> Rating:
     """若干段等级中最差的一级：正常 < 关注 < 关闭。"""
     return max(ratings, key=lambda r: _RANK[r])

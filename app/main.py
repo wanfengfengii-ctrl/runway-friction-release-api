@@ -15,7 +15,9 @@ from app.service import assess
 
 DESCRIPTION = """雨后跑道摩阻评估 API。
 
-- 一次提交包含跑道编号及前、中、后三段，每段 3 个、至多两位小数的摩阻系数（0.00–1.00）。
+- 一次提交包含跑道编号及前、中、后三段，默认每段 3 个、至多两位小数的摩阻系数（0.00–1.00）。
+- 可选 `"sampling": "five_point"` 五点稳健采样：每段提交 5 个系数，排序后各剔除
+  一个最低值与最高值，取剩余三值的中位数，并随段结果返回剔除值与参与判定的三值。
 - 服务取每段中位数判级：≥0.40 正常，0.30–<0.40 关注，<0.30 关闭。
 - 整跑道采用三段中的最差等级。
 - 任何输入不合法均以 422 整份拒绝，不返回部分判定。
@@ -88,6 +90,7 @@ def health() -> dict[str, str]:
 @app.post(
     "/api/v1/friction/assess",
     response_model=FrictionAssessment,
+    response_model_exclude_none=True,
     tags=["摩阻评估"],
     summary="提交三段摩阻测量值并获取整跑道判级",
 )

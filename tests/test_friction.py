@@ -8,6 +8,7 @@ from app.friction import (
     Rating,
     grade_median,
     median_of_three,
+    robust_median_of_five,
     worst_rating,
 )
 
@@ -40,6 +41,31 @@ def test_median_is_middle_value_regardless_of_order():
 def test_median_of_three_is_always_one_of_inputs():
     values = [0.33, 0.47, 0.29]
     assert median_of_three(values) in values
+
+
+def test_robust_median_of_five_drops_one_min_and_one_max():
+    median, excluded, used = robust_median_of_five([0.45, 0.99, 0.42, 0.44, 0.43])
+    assert excluded == [0.42, 0.99]
+    assert used == [0.43, 0.44, 0.45]
+    assert median == 0.44
+
+
+def test_robust_median_of_five_duplicate_extremes_removed_once_each():
+    # 两个相同最低值：只按位置剔除一个，另一个仍参与判定
+    median, excluded, used = robust_median_of_five([0.10, 0.10, 0.35, 0.50, 0.90])
+    assert excluded == [0.10, 0.90]
+    assert used == [0.10, 0.35, 0.50]
+    assert median == 0.35
+    # 两个相同最高值同理
+    median, excluded, used = robust_median_of_five([0.10, 0.30, 0.35, 0.90, 0.90])
+    assert excluded == [0.10, 0.90]
+    assert used == [0.30, 0.35, 0.90]
+    assert median == 0.35
+
+
+def test_robust_median_of_five_all_equal_values():
+    median, excluded, used = robust_median_of_five([0.50] * 5)
+    assert (median, excluded, used) == (0.50, [0.50, 0.50], [0.50, 0.50, 0.50])
 
 
 def test_worst_rating_orders_and_ties():

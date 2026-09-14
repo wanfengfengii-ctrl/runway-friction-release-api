@@ -148,6 +148,124 @@ def main() -> int:
     status, data = request_json(raw, 200)
     check("0.00/1.00/0.30 边界可提交", status == 200, str(status))
 
+    # 6. 五点稳健采样：抵抗单个异常高/低值，剔除值与参与判定三值随段返回
+    body = {
+        "runway_id": "18L",
+        "sampling": "five_point",
+        "front": [0.42, 0.43, 0.44, 0.45, 0.99],   # 单个异常高值
+        "middle": [0.01, 0.42, 0.43, 0.44, 0.45],  # 单个异常低值
+        "rear": [0.60, 0.65, 0.70, 0.75, 0.80],
+    }
+    status, data = request_json(json.dumps(body), 200)
+    check("五点模式返回 200", status == 200, str(status))
+    if status == 200:
+        by_name = {s["segment"]: s for s in data["segments"]}
+        front, middle = by_name["front"], by_name["middle"]
+        check("五点模式抵抗单个异常高值",
+              front["median"] == 0.44 and front["rating"] == "正常", str(front))
+        check("  └ 高值剔除与参与值正确",
+              front["excluded_values"] == [0.42, 0.99]
+              and front["used_values"] == [0.43, 0.44, 0.45]
+              and front["raw_values"] == body["front"], str(front))
+        check("五点模式抵抗单个异常低值",
+              middle["median"] == 0.43 and middle["rating"] == "正常", str(middle))
+        check("  └ 低值剔除与参与值正确",
+              middle["excluded_values"] == [0.01, 0.45]
+              and middle["used_values"] == [0.42, 0.43, 0.44], str(middle))
+
+    # 7. 五点模式临界落级：0.40→正常，0.30→关注，0.29→关闭，最差段接管
+    body = {
+        "runway_id": "36R",
+        "sampling": "five_point",
+        "front": [0.10, 0.39, 0.40, 0.50, 0.90],
+        "middle": [0.10, 0.20, 0.30, 0.80, 0.90],
+        "rear": [0.10, 0.20, 0.29, 0.80, 0.90],
+    }
+    status, data = request_json(json.dumps(body), 200)
+    check("五点临界请求返回 200", status == 200, str(status))
+    if status == 200:
+        ratings = {s["segment"]: (s["median"], s["rating"]) for s in data["segments"]}
+        check("五点中位数 0.40 落级正常", ratings["front"] == (0.40, "正常"), str(ratings["front"]))
+        check("五点中位数 0.30 落级关注", ratings["middle"] == (0.30, "关注"), str(ratings["middle"]))
+        check("五点中位数 0.29 落级关闭", ratings["rear"] == (0.29, "关闭"), str(ratings["rear"]))
+        check("五点最差段(后段)接管结论",
+              data["overall_rating"] == "关闭" and data["worst_segments"] == ["rear"],
+              str(data.get("worst_segments")))
+
+    # 8. 多个相同极值只按位置各剔除一个
+    body = {
+        "runway_id": "09",
+        "sampling": "five_point",
+        "front": [0.10, 0.10, 0.35, 0.50, 0.90],   # 两个相同最低值
+        "middle": [0.10, 0.30, 0.35, 0.90, 0.90],  # 两个相同最高值
+        "rear": [0.50, 0.50, 0.50, 0.50, 0.50],
+    }
+    status, data = request_json(json.dumps(body), 200)
+    check("相同极值请求返回 200", status == 200, str(status))
+    if status == 200:
+        by_name = {s["segment"]: s for s in data["segments"]}
+        front, middle = by_name["front"], by_name["middle"]
+        check("相同最低值只剔除一个",
+              front["excluded_values"] == [0.10, 0.90]
+              and front["used_values"] == [0.10, 0.35, 0.50]
+              and front["median"] == 0.35, str(front))
+        check("相同最高值只剔除一个",
+              middle["excluded_values"] == [0.10, 0.90]
+              and middle["used_values"] == [0.30, 0.35, 0.90]
+              and middle["median"] == 0.35, str(middle))
+
+    # 9. 三值旧请求返回原结构（不含五点字段），判级结果不变
+    body = {
+        "runway_id": "18L",
+        "front": [0.52, 0.31, 0.60],
+        "middle": [0.40, 0.45, 0.90],
+        "rear": [0.70, 0.80, 0.29],
+    }
+    status, data = request_json(json.dumps(body), 200)
+    check("旧请求返回 200", status == 200, str(status))
+    if status == 200:
+        check("旧请求段结构保持原样（无五点字段）",
+              all(set(s) == {"segment", "label", "raw_values", "median", "rating"}
+                  for s in data["segments"]),
+              str(data["segments"][0]))
+        check("旧请求判级结果不变",
+              data["overall_rating"] == "正常"
+              and [s["median"] for s in data["segments"]] == [0.52, 0.45, 0.70],
+              str(data.get("overall_rating")))
+
+    # 10. 五点模式 422 整份拒绝：段值数不符、越界、精度、非有限数、非法采样方式
+    five_rejected: list[tuple[str, str | bytes, str]] = [
+        ("五点模式混入四值段", json.dumps({"runway_id": "18", "sampling": "five_point",
+                                           "front": [0.5] * 5, "middle": [0.5] * 4,
+                                           "rear": [0.5] * 5}), "middle"),
+        ("五点模式混入三值段", json.dumps({"runway_id": "18", "sampling": "five_point",
+                                           "front": [0.5] * 5, "middle": [0.5] * 5,
+                                           "rear": [0.5] * 3}), "rear"),
+        ("五点模式越界 1.01", json.dumps({"runway_id": "18", "sampling": "five_point",
+                                          "front": [1.01, 0.5, 0.5, 0.5, 0.5],
+                                          "middle": [0.5] * 5, "rear": [0.5] * 5}), "front"),
+        ("五点模式精度超限 0.123", json.dumps({"runway_id": "18", "sampling": "five_point",
+                                               "front": [0.5] * 5,
+                                               "middle": [0.123, 0.5, 0.5, 0.5, 0.5],
+                                               "rear": [0.5] * 5}), "middle"),
+        ("五点模式非有限值 NaN",
+         b'{"runway_id":"18","sampling":"five_point","front":[0.5,0.5,0.5,0.5,NaN],'
+         b'"middle":[0.5,0.5,0.5,0.5,0.5],"rear":[0.5,0.5,0.5,0.5,0.5]}', "front"),
+        ("非法采样方式", json.dumps({"runway_id": "18", "sampling": "seven_point",
+                                     "front": [0.5] * 3, "middle": [0.5] * 3,
+                                     "rear": [0.5] * 3}), "sampling"),
+    ]
+    for name, raw, segment in five_rejected:
+        status, data = request_json(raw, 422)
+        ok = status == 422 and isinstance(data.get("detail"), list) and bool(data["detail"])
+        check(f"422 拒绝：{name}", ok, f"status={status}, body={str(data)[:160]}")
+        if ok:
+            locs = [err.get("loc", []) for err in data["detail"]]
+            check(f"  └ 错误位置指向 {segment}",
+                  any(segment in loc for loc in locs), str(locs))
+            check(f"  └ 无部分判定：{name}",
+                  "segments" not in data and "overall_rating" not in data)
+
     print()
     if _failures:
         print(f"验收失败：{len(_failures)} 项 —— {_failures}")

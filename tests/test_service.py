@@ -81,3 +81,73 @@ def test_unsorted_inputs_still_grade_by_median():
 def test_input_model_rejects_invalid_count():
     with pytest.raises(Exception):
         FrictionInput(runway_id="18", front=[0.5, 0.5], middle=[0.5] * 3, rear=[0.5] * 3)
+
+
+# ---------- 五点稳健采样 ----------
+
+def _payload_five(front, middle, rear, runway_id="18L"):
+    return FrictionInput(
+        runway_id=runway_id,
+        sampling="five_point",
+        front=front,
+        middle=middle,
+        rear=rear,
+    )
+
+
+def test_five_point_resists_single_high_spike():
+    # 单个异常高值（如仪器瞬时跳变）被剔除，不拖垮判级
+    result = assess(_payload_five([0.42, 0.43, 0.44, 0.45, 0.99], [0.50] * 5, [0.60] * 5))
+    front = result.segments[0]
+    assert front.raw_values == [0.42, 0.43, 0.44, 0.45, 0.99]
+    assert front.excluded_values == [0.42, 0.99]
+    assert front.used_values == [0.43, 0.44, 0.45]
+    assert front.median == 0.44
+    assert front.rating is Rating.NORMAL
+    assert result.overall_rating is Rating.NORMAL
+
+
+def test_five_point_resists_single_low_dip():
+    # 单个异常低值（如局部积水）被剔除
+    result = assess(_payload_five([0.01, 0.42, 0.43, 0.44, 0.45], [0.50] * 5, [0.60] * 5))
+    front = result.segments[0]
+    assert front.excluded_values == [0.01, 0.45]
+    assert front.used_values == [0.42, 0.43, 0.44]
+    assert front.median == 0.43
+    assert front.rating is Rating.NORMAL
+
+
+def test_five_point_critical_boundaries_fall_on_correct_side():
+    # 五点中位数恰好 0.40 -> 正常；恰好 0.30 -> 关注；0.29 -> 关闭
+    result = assess(_payload_five(
+        [0.10, 0.39, 0.40, 0.50, 0.90],
+        [0.10, 0.20, 0.30, 0.80, 0.90],
+        [0.10, 0.20, 0.29, 0.80, 0.90],
+    ))
+    assert [s.median for s in result.segments] == [0.40, 0.30, 0.29]
+    assert [s.rating for s in result.segments] == [Rating.NORMAL, Rating.WATCH, Rating.CLOSED]
+    assert result.overall_rating is Rating.CLOSED
+    assert result.worst_segments == ["rear"]
+
+
+def test_five_point_duplicate_extremes_removed_once_by_position():
+    result = assess(_payload_five([0.10, 0.10, 0.35, 0.50, 0.90], [0.50] * 5, [0.50] * 5))
+    front = result.segments[0]
+    assert front.excluded_values == [0.10, 0.90]
+    assert front.used_values == [0.10, 0.35, 0.50]
+    assert front.median == 0.35
+    assert front.rating is Rating.WATCH
+
+
+def test_three_point_result_carries_no_five_point_fields():
+    result = assess(_payload([0.50, 0.60, 0.55], [0.50] * 3, [0.50] * 3))
+    for segment in result.segments:
+        assert segment.excluded_values is None
+        assert segment.used_values is None
+
+
+def test_five_point_mode_requires_five_values_in_every_segment():
+    with pytest.raises(Exception):
+        _payload_five([0.50] * 5, [0.50] * 4, [0.50] * 5)
+    with pytest.raises(Exception):
+        _payload_five([0.50] * 5, [0.50] * 5, [0.50] * 3)

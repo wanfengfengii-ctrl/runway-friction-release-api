@@ -199,3 +199,132 @@ def test_boundary_values_000_and_100_are_accepted():
     data = response.json()
     assert [s["rating"] for s in data["segments"]] == ["关闭", "正常", "关注"]
     assert data["overall_rating"] == "关闭"
+
+
+# ---------- 五点稳健采样 ----------
+
+def five_point_body(**overrides):
+    body = {
+        "runway_id": "18L",
+        "sampling": "five_point",
+        "front": [0.42, 0.43, 0.44, 0.45, 0.99],
+        "middle": [0.01, 0.42, 0.43, 0.44, 0.45],
+        "rear": [0.60, 0.65, 0.70, 0.75, 0.80],
+    }
+    body.update(overrides)
+    return body
+
+
+def test_five_point_success_response_shape():
+    response = post(five_point_body())
+    assert response.status_code == 200, response.text
+    data = response.json()
+
+    assert [s["segment"] for s in data["segments"]] == ["front", "middle", "rear"]
+    front, middle, rear = data["segments"]
+
+    # 单个异常高值被剔除：原始五值、剔除值、参与判定三值随段返回
+    assert front["raw_values"] == [0.42, 0.43, 0.44, 0.45, 0.99]
+    assert front["excluded_values"] == [0.42, 0.99]
+    assert front["used_values"] == [0.43, 0.44, 0.45]
+    assert front["median"] == 0.44
+    assert front["rating"] == "正常"
+
+    # 单个异常低值被剔除
+    assert middle["excluded_values"] == [0.01, 0.45]
+    assert middle["used_values"] == [0.42, 0.43, 0.44]
+    assert middle["median"] == 0.43
+    assert middle["rating"] == "正常"
+
+    assert rear["median"] == 0.70
+    assert data["overall_rating"] == "正常"
+    assert data["worst_segments"] == ["front", "middle", "rear"]
+
+
+def test_five_point_critical_boundaries():
+    body = five_point_body(
+        front=[0.10, 0.39, 0.40, 0.50, 0.90],
+        middle=[0.10, 0.20, 0.30, 0.80, 0.90],
+        rear=[0.10, 0.20, 0.29, 0.80, 0.90],
+    )
+    data = post(body).json()
+    ratings = {s["segment"]: (s["median"], s["rating"]) for s in data["segments"]}
+    assert ratings["front"] == (0.40, "正常")
+    assert ratings["middle"] == (0.30, "关注")
+    assert ratings["rear"] == (0.29, "关闭")
+    assert data["overall_rating"] == "关闭"
+    assert data["worst_segments"] == ["rear"]
+
+
+def test_five_point_duplicate_extremes_removed_once_by_position():
+    body = five_point_body(
+        front=[0.10, 0.10, 0.35, 0.50, 0.90],
+        middle=[0.10, 0.30, 0.35, 0.90, 0.90],
+        rear=[0.50] * 5,
+    )
+    data = post(body).json()
+    front, middle, _ = data["segments"]
+    assert front["excluded_values"] == [0.10, 0.90]
+    assert front["used_values"] == [0.10, 0.35, 0.50]
+    assert front["median"] == 0.35
+    assert middle["excluded_values"] == [0.10, 0.90]
+    assert middle["used_values"] == [0.30, 0.35, 0.90]
+    assert middle["median"] == 0.35
+
+
+def test_legacy_three_value_response_has_original_shape():
+    data = post(valid_body()).json()
+    assert set(data) == {"runway_id", "segments", "overall_rating", "worst_segments"}
+    for segment in data["segments"]:
+        assert set(segment) == {"segment", "label", "raw_values", "median", "rating"}
+
+
+def test_five_point_mixed_four_value_segment_is_rejected():
+    response = post(five_point_body(middle=[0.50, 0.50, 0.50, 0.50]))
+    _assert_422_without_assessment(response)
+    locs = [tuple(err["loc"]) for err in response.json()["detail"]]
+    assert any("middle" in loc for loc in locs)
+
+
+def test_five_point_three_value_segment_is_rejected():
+    response = post(five_point_body(rear=[0.50, 0.50, 0.50]))
+    _assert_422_without_assessment(response)
+    locs = [tuple(err["loc"]) for err in response.json()["detail"]]
+    assert any("rear" in loc for loc in locs)
+
+
+def test_five_point_invalid_values_are_rejected_with_segment_location():
+    cases = [
+        ("front", [1.01, 0.5, 0.5, 0.5, 0.5]),    # 越界
+        ("middle", [0.123, 0.5, 0.5, 0.5, 0.5]),  # 精度超限
+        ("rear", [0.5, 0.5, 0.5, 0.5, True]),     # 布尔非数值
+    ]
+    for segment, bad in cases:
+        response = post(five_point_body(**{segment: bad}))
+        _assert_422_without_assessment(response)
+        locs = [tuple(err["loc"]) for err in response.json()["detail"]]
+        assert any(segment in loc for loc in locs)
+
+
+def test_five_point_non_finite_is_rejected():
+    raw = (
+        '{"runway_id":"18L","sampling":"five_point",'
+        '"front":[0.5,0.5,0.5,0.5,NaN],'
+        '"middle":[0.5,0.5,0.5,0.5,0.5],'
+        '"rear":[0.5,0.5,0.5,0.5,0.5]}'
+    )
+    response = client.post(
+        "/api/v1/friction/assess",
+        content=raw,
+        headers={"content-type": "application/json"},
+    )
+    _assert_422_without_assessment(response)
+    locs = [tuple(err["loc"]) for err in response.json()["detail"]]
+    assert any("front" in loc for loc in locs)
+
+
+def test_unknown_sampling_mode_is_rejected():
+    response = post(valid_body(sampling="seven_point"))
+    _assert_422_without_assessment(response)
+    locs = [tuple(err["loc"]) for err in response.json()["detail"]]
+    assert any("sampling" in loc for loc in locs)

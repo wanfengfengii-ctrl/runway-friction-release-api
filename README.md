@@ -2,14 +2,16 @@
 
 纯后端 JSON API：维护人员一次提交跑道编号与前、中、后三段各 3 个摩阻系数，
 服务取每段中位数分段判级，并按三段中的最差等级给出整跑道结论。
+雨后复测受局部积水或仪器瞬时跳变影响时，可改用**五点稳健采样**（每段 5 个系数，
+剔除一个最低值与一个最高值后取剩余三值的中位数），从同一入口取得整跑道结论。
 
 - **运行时**：Python 3.12 · FastAPI · Pydantic v2
-- **测试**：pytest（41 项，覆盖输入校验、分段判级、结果组装与 422 整份拒绝）
+- **测试**：pytest（59 项，覆盖输入校验、分段判级、五点稳健采样、结果组装与 422 整份拒绝）
 - **部署**：Docker Compose（默认仅运行 API；宿主端口可用 `API_PORT` 覆盖）
 
 ## 判级规则
 
-对每一段的 3 个测量值取中位数：
+对每一段的测量值取中位数（五点模式先剔除极值，见下节）：
 
 | 中位数区间 | 段等级 |
 | --- | --- |
@@ -21,12 +23,26 @@
 整跑道等级取三段中最差者（正常 < 关注 < 关闭），响应中 `worst_segments`
 明确指出是哪一段（或哪几段并列）接管了结论。
 
+## 五点稳健采样（可选）
+
+在请求中加入 `"sampling": "five_point"` 即可启用，三段须统一按五点提交
+（任一段不是 5 个值即整份 422 拒绝）。每段处理规则：
+
+1. 按数值排序；
+2. 剔除一个最低值与一个最高值（多个相同极值只按位置各剔除一个）；
+3. 取剩余三值的中位数，复用同一套阈值判级、最差段选择与段顺序。
+
+五点模式下每个段结果额外返回 `excluded_values`（被剔除的最低/最高值）与
+`used_values`（实际参与判定的三值），`raw_values` 仍回显原始五值；
+未传 `sampling` 的三值请求响应结构保持不变（不含这两个字段）。
+
 ## 输入约束（任一不满足均返回 422，不返回部分判定）
 
 - 必须恰好包含 `front`（前）、`middle`（中）、`rear`（后）三段，不得缺少、重复或多出；
-- 每段必须恰好 3 个数字；
+- 每段必须恰好 3 个数字；选择 `five_point` 时每段必须恰好 5 个数字；
 - 系数仅允许 `0.00` 至 `1.00`，至多保留两位小数；
 - 非有限数（`NaN` / `Infinity` / `-Infinity`）、字符串、布尔值均拒绝；
+- `sampling` 仅允许 `three_point`（默认，可省略）或 `five_point`；
 - `runway_id` 为非空字符串（纯空白也拒绝）。
 
 ## 接口
@@ -38,12 +54,14 @@
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `runway_id` | string | 跑道编号，1–16 个字符，非空白 |
-| `front` | number[3] | 前段 3 个摩阻系数 |
-| `middle` | number[3] | 中段 3 个摩阻系数 |
-| `rear` | number[3] | 后段 3 个摩阻系数 |
+| `sampling` | string | 可选；`three_point`（默认）或 `five_point`（五点稳健采样） |
+| `front` | number[] | 前段摩阻系数，默认 3 个、五点模式 5 个 |
+| `middle` | number[] | 中段摩阻系数，默认 3 个、五点模式 5 个 |
+| `rear` | number[] | 后段摩阻系数，默认 3 个、五点模式 5 个 |
 
 响应 `200`：按前、中、后顺序给出每段的原始值 `raw_values`、中位数 `median`、
 段等级 `rating`，以及唯一的整跑道等级 `overall_rating` 和最差段 `worst_segments`。
+五点模式下每段另含 `excluded_values` 与 `used_values`。
 
 #### 请求示例
 
@@ -94,6 +112,59 @@ curl -X POST http://localhost:8000/api/v1/friction/assess \
 }
 ```
 
+#### 五点稳健采样示例
+
+```bash
+curl -X POST http://localhost:8000/api/v1/friction/assess \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "runway_id": "18L",
+    "sampling": "five_point",
+    "front":  [0.42, 0.43, 0.44, 0.45, 0.99],
+    "middle": [0.10, 0.20, 0.30, 0.80, 0.90],
+    "rear":   [0.60, 0.65, 0.70, 0.75, 0.80]
+  }'
+```
+
+前段的单个异常高值 0.99 被剔除，不影响判级；响应中每段附带剔除值与参与判定的三值：
+
+```json
+{
+  "runway_id": "18L",
+  "segments": [
+    {
+      "segment": "front",
+      "label": "前段",
+      "raw_values": [0.42, 0.43, 0.44, 0.45, 0.99],
+      "median": 0.44,
+      "rating": "正常",
+      "excluded_values": [0.42, 0.99],
+      "used_values": [0.43, 0.44, 0.45]
+    },
+    {
+      "segment": "middle",
+      "label": "中段",
+      "raw_values": [0.10, 0.20, 0.30, 0.80, 0.90],
+      "median": 0.30,
+      "rating": "关注",
+      "excluded_values": [0.10, 0.90],
+      "used_values": [0.20, 0.30, 0.80]
+    },
+    {
+      "segment": "rear",
+      "label": "后段",
+      "raw_values": [0.60, 0.65, 0.70, 0.75, 0.80],
+      "median": 0.70,
+      "rating": "正常",
+      "excluded_values": [0.60, 0.80],
+      "used_values": [0.65, 0.70, 0.75]
+    }
+  ],
+  "overall_rating": "关注",
+  "worst_segments": ["middle"]
+}
+```
+
 #### 422 拒绝示例
 
 ```bash
@@ -117,7 +188,8 @@ HTTP/2 422
 }
 ```
 
-缺段、重复段名（JSON 中重复键）、数量不符、越界、非有限数等情形同以 422 整份拒绝。
+缺段、重复段名（JSON 中重复键）、数量不符（含五点模式下非 5 值的段）、越界、
+非有限数等情形同以 422 整份拒绝，错误位置 `loc` 指向对应段。
 
 ### `GET /health`
 
@@ -150,7 +222,8 @@ docker compose down
 ### 一次性验收服务 `verify`
 
 仓库内置零第三方依赖的验收脚本 `scripts/acceptance.py`，会对运行中的 API
-执行健康检查、合法判级、临界值归属、最差段接管及完整 422 拒绝矩阵，
+执行健康检查、合法判级、临界值归属、最差段接管、五点稳健采样（抗单个异常
+高/低值、相同极值只剔一个、旧请求结构不变）及完整 422 拒绝矩阵，
 输出逐项 PASS/FAIL 并以退出码表示结论。在 Compose 中它是**一次性**服务
 （`docker compose run --rm`，跑完即退出并自动删除容器）：
 
@@ -173,7 +246,7 @@ BASE_URL=http://127.0.0.1:8000 python3 scripts/acceptance.py
 ```
 app/
   __init__.py
-  friction.py    # 领域规则：中位数、阈值判级、最差等级（纯函数）
+  friction.py    # 领域规则：三点/五点中位数、阈值判级、最差等级（纯函数）
   schemas.py     # Pydantic 请求/响应模型与输入校验
   service.py     # 结果组装：段顺序、整体等级、最差段
   main.py        # FastAPI 应用、严格 JSON 解析（含重复键检测）、422
