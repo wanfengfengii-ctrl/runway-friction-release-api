@@ -1,0 +1,36 @@
+services:
+  api:
+    build: .
+    image: runway-friction-api:latest
+    ports:
+      # 宿主端口由 API_PORT 覆盖，默认 8000；容器内固定监听 8000
+      - "${API_PORT:-8000}:8000"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status == 200 else 1)"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  # 一次性验收服务：默认 `docker compose up` 不会启动它（位于 verify profile）。
+  # 运行 `docker compose --profile verify run --rm verify` 即可对在线 API 执行验收脚本，
+  # 结束后容器自动退出并删除。
+  verify:
+    profiles:
+      - verify
+    image: runway-friction-api:latest
+    build: .
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      BASE_URL: http://api:8000
+    command:
+      - "python"
+      - "scripts/acceptance.py"
+    restart: "no"

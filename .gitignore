@@ -1,0 +1,24 @@
+# Python 本地产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 虚拟环境
+.venv/
+venv/
+
+# 测试 / 类型检查缓存
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# 本地环境变量与编辑器产物
+.env
+.*.local
+.DS_Store
+.idea/
+.vscode/
