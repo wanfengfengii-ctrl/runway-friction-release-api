@@ -387,6 +387,33 @@ def test_segment_sample_still_needs_coefficient_constraints():
     assert any("middle" in loc for loc in _locs(payload))
 
 
+# 超出 float 可表示范围的整数：float() 转换会 OverflowError，必须 422 而非 500
+HUGE_INT = 10 ** 400
+
+
+def test_huge_integer_anchor_values_are_rejected():
+    for field in ("reading", "true_value"):
+        anchors = [dict(anchor) for anchor in CASCADE_ANCHORS]
+        anchors[0][field] = HUGE_INT
+        payload = _assert_422_without_assessment(post(calibrated_body(anchors=anchors)))
+        assert any("anchors" in loc for loc in _locs(payload))
+
+
+def test_huge_integer_segment_sample_is_rejected():
+    for segment in ("front", "middle", "rear"):
+        body = calibrated_body(**{segment: [0.10, 0.20, HUGE_INT]})
+        payload = _assert_422_without_assessment(post(body))
+        assert any(segment in loc for loc in _locs(payload))
+
+
+def test_huge_integer_error_response_stays_valid_json():
+    # 超大整数回显在错误详情 input 中，响应仍须为合法 JSON 且不泄露部分判定
+    payload = _assert_422_without_assessment(
+        post(calibrated_body(front=[0.10, 0.20, HUGE_INT]))
+    )
+    assert payload["detail"][0]["input"] == [0.10, 0.20, HUGE_INT]
+
+
 def test_calibrated_segment_count_follows_sampling_mode():
     payload = _assert_422_without_assessment(post(calibrated_body(front=[0.10, 0.20])))
     assert any("front" in loc for loc in _locs(payload))

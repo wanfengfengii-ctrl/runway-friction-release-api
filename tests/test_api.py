@@ -135,6 +135,14 @@ def test_non_finite_numbers_are_rejected(token):
     _assert_422_without_assessment(response)
 
 
+def test_huge_integer_value_is_rejected():
+    # 超出 float 可表示范围的整数：必须 422 整份拒绝而非 500
+    response = post(valid_body(front=[10 ** 400, 0.5, 0.5]))
+    _assert_422_without_assessment(response)
+    locs = [tuple(err["loc"]) for err in response.json()["detail"]]
+    assert any("front" in loc for loc in locs)
+
+
 def test_missing_segment_is_rejected():
     body = valid_body()
     del body["middle"]

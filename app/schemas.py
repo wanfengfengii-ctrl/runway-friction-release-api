@@ -46,7 +46,14 @@ def _check_coefficient(item: Any) -> float:
     # bool 是 int 的子类，须在数值判断前排除
     if isinstance(item, bool) or not isinstance(item, (int, float)):
         raise ValueError("摩阻系数必须是数字")
-    coefficient = float(item)
+    try:
+        coefficient = float(item)
+    except OverflowError:
+        # 超大整数超出浮点可表示范围，必然越界；须转为校验错误以 422 整份拒绝，
+        # 否则 OverflowError（非 ValueError 子类）会穿透校验层变成 500
+        raise ValueError(
+            f"摩阻系数必须介于 {MIN_VALUE:.2f} 与 {MAX_VALUE:.2f} 之间"
+        ) from None
     if not math.isfinite(coefficient):
         raise ValueError("摩阻系数必须为有限数")
     if not (MIN_VALUE <= coefficient <= MAX_VALUE):

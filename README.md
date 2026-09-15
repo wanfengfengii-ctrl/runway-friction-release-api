@@ -9,7 +9,7 @@
 相邻违序合并，每个段样本以精确对应锚点最终所属块的拟合值校准后进入同一套判级。
 
 - **运行时**：Python 3.12 · FastAPI · Pydantic v2
-- **测试**：pytest（89 项，覆盖输入校验、分段判级、五点稳健采样、等权相邻违序合并、
+- **测试**：pytest（93 项，覆盖输入校验、分段判级、五点稳健采样、等权相邻违序合并、
   校准评估、结果组装与 422 整份拒绝）
 - **部署**：Docker Compose（默认仅运行 API；宿主端口可用 `API_PORT` 覆盖）
 
@@ -142,6 +142,7 @@ curl -X POST http://localhost:8000/api/v1/friction/calibrated-assess \
 - 每段必须恰好 3 个数字；选择 `five_point` 时每段必须恰好 5 个数字；
 - 系数仅允许 `0.00` 至 `1.00`，至多保留两位小数；
 - 非有限数（`NaN` / `Infinity` / `-Infinity`）、字符串、布尔值均拒绝；
+  超出浮点可表示范围的超大整数同样以 422 整份拒绝（按越界处理）；
 - `sampling` 仅允许 `three_point`（默认，可省略）或 `five_point`；
 - `runway_id` 为非空字符串（纯空白也拒绝）。
 

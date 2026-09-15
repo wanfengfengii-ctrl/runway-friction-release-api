@@ -130,6 +130,8 @@ def main() -> int:
                          b'"middle":[0.5,0.5,0.5],"rear":[0.5,0.5,0.5]}'),
         ("非有限值 Infinity", b'{"runway_id":"18","front":[0.5,0.5,Infinity],'
                               b'"middle":[0.5,0.5,0.5],"rear":[0.5,0.5,0.5]}'),
+        ("超大整数样本", json.dumps({"runway_id": "18", "front": [10 ** 400, 0.5, 0.5],
+                                     "middle": [0.5] * 3, "rear": [0.5] * 3})),
         ("重复段名 middle", b'{"runway_id":"18","front":[0.5,0.5,0.5],'
                             b'"middle":[0.4,0.4,0.4],"middle":[0.1,0.1,0.1],'
                             b'"rear":[0.5,0.5,0.5]}'),
@@ -335,6 +337,14 @@ def main() -> int:
                                          "front": [0.10, 0.20, 0.35],
                                          "middle": [0.10, 0.20, 0.30],
                                          "rear": [0.10, 0.20, 0.30]}), "front"),
+        ("锚点超大整数", json.dumps({"runway_id": "18", "anchors": [
+            {"reading": 0.10, "true_value": 10 ** 400}] + cascade_anchors[1:4],
+            "front": [0.10, 0.20, 0.30], "middle": [0.10, 0.20, 0.30],
+            "rear": [0.10, 0.20, 0.30]}), "anchors"),
+        ("段样本超大整数", json.dumps({"runway_id": "18", "anchors": cascade_anchors,
+                                       "front": [0.10, 0.20, 10 ** 400],
+                                       "middle": [0.10, 0.20, 0.30],
+                                       "rear": [0.10, 0.20, 0.30]}), "front"),
         ("锚点非有限值 NaN",
          b'{"runway_id":"18","anchors":[{"reading":0.10,"true_value":0.50},'
          b'{"reading":0.20,"true_value":0.40},{"reading":0.30,"true_value":0.20},'
