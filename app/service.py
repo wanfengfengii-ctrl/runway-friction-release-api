@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from app.friction import (
     SEGMENT_LABELS,
     SEGMENT_ORDER,
     adjacent_violator_blocks,
     grade_median,
+    grade_profile_average,
+    lowest_average_window,
     median_of_three,
     robust_median_of_five,
+    round_profile_output,
     worst_rating,
 )
 from app.schemas import (
@@ -18,6 +23,8 @@ from app.schemas import (
     CalibratedSegmentResult,
     FrictionAssessment,
     FrictionInput,
+    ProfileFrictionAssessment,
+    ProfileFrictionInput,
     SamplingMode,
     SegmentResult,
 )
@@ -117,4 +124,33 @@ def assess_calibrated(data: CalibratedFrictionInput) -> CalibratedFrictionAssess
         segments=segment_results,
         overall_rating=overall,
         worst_segments=worst_segments,
+    )
+
+
+def _profile_output(value: Decimal) -> float:
+    """剖面评估输出：保留六位小数（四舍五入）后转为 JSON 数字。"""
+    return float(round_profile_output(value))
+
+
+def assess_profile(data: ProfileFrictionInput) -> ProfileFrictionAssessment:
+    """连续巡检剖面评估：在线性插值剖面上找平均摩阻最低的定长检查窗。
+
+    相邻测点线性插值、分段梯形积分建立前缀面积，按测点里程及其减去窗长的
+    位置切分窗口起点域，逐区间检查两端与内部驻点（窗口两端插值相等处），
+    全局取窗口平均值最小者，并列取起点最小者。判级使用未舍入的平均值，
+    响应数值统一保留六位小数。
+    """
+    mileages = [point.mileage for point in data.points]
+    coefficients = [point.coefficient for point in data.points]
+    window = lowest_average_window(mileages, coefficients, data.window_length)
+
+    return ProfileFrictionAssessment(
+        runway_id=data.runway_id,
+        start_mileage=_profile_output(window.start),
+        end_mileage=_profile_output(window.end),
+        start_friction=_profile_output(window.start_value),
+        end_friction=_profile_output(window.end_value),
+        area=_profile_output(window.area),
+        average=_profile_output(window.average),
+        rating=grade_profile_average(window.average),
     )

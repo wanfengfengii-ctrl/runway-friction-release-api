@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import statistics
+from bisect import bisect_right
+from decimal import ROUND_HALF_UP, Decimal, localcontext
 from enum import Enum
+from typing import NamedTuple
 
 
 class Rating(str, Enum):
@@ -109,3 +112,137 @@ def adjacent_violator_blocks(values: list[float]) -> tuple[list[float], list[int
             fitted[index] = mean
             block_ids[index] = block_id
     return fitted, block_ids
+
+
+# ---------- 连续巡检剖面：平均摩阻最低的定长检查窗 ----------
+
+# 剖面评估输出统一保留六位小数（四舍五入）
+PROFILE_OUTPUT_QUANTUM = Decimal("0.000001")
+
+# 窗口平均值判级沿用三点 / 五点同一套边界，Decimal 精确比较（判级用未舍入值）
+_PROFILE_NORMAL_THRESHOLD = Decimal("0.40")
+_PROFILE_WATCH_THRESHOLD = Decimal("0.30")
+
+# 剖面计算的局部精度：远高于六位输出精度，避免中间除法（斜率、驻点）的舍入噪声
+_PROFILE_PRECISION = 40
+
+
+class LowestWindow(NamedTuple):
+    """平均摩阻最低的定长检查窗（各字段均为未舍入的 Decimal）。"""
+
+    start: Decimal
+    end: Decimal
+    start_value: Decimal
+    end_value: Decimal
+    area: Decimal
+    average: Decimal
+
+
+def grade_profile_average(average: Decimal) -> Rating:
+    """按未舍入的窗口平均值判级：>= 0.40 正常，0.30–<0.40 关注，< 0.30 关闭。"""
+    if average >= _PROFILE_NORMAL_THRESHOLD:
+        return Rating.NORMAL
+    if average >= _PROFILE_WATCH_THRESHOLD:
+        return Rating.WATCH
+    return Rating.CLOSED
+
+
+def round_profile_output(value: Decimal) -> Decimal:
+    """剖面评估输出数值统一保留六位小数（四舍五入）。"""
+    return value.quantize(PROFILE_OUTPUT_QUANTUM, rounding=ROUND_HALF_UP)
+
+
+def lowest_average_window(
+    mileages: list[Decimal],
+    coefficients: list[Decimal],
+    window_length: Decimal,
+) -> LowestWindow:
+    """连续巡检剖面上平均摩阻最低的定长检查窗。
+
+    前置条件（由请求模型保证）：里程严格递增、首点里程为 0、末点里程等于跑道
+    长度、测点 6–50 个、窗长大于 0 且小于跑道长度。
+
+    相邻测点间作线性插值，以分段梯形积分建立前缀面积 P。窗口平均
+    A(s) = (P(s+w) − P(s)) / w 在起点域 [0, L−w] 上分段二次，分段点为测点里程
+    x_i 及其减去窗长的位置 x_i − w；按这些位置切分起点域后，每个区间检查两端
+    与满足窗口两端插值相等（f(s) == f(s+w)）的内部驻点，而非只枚举测点起点。
+    全局以窗口平均值最小者为结果，并列时选择起点最小者。
+
+    全程 Decimal 运算（局部精度 40 位），返回未舍入结果；判级与输出舍入由
+    ``grade_profile_average`` / ``round_profile_output`` 分别完成。
+    """
+    with localcontext() as context:
+        context.prec = _PROFILE_PRECISION
+        xs = mileages
+        ys = coefficients
+        w = window_length
+        count = len(xs)
+
+        # 每段斜率与测点处的前缀梯形面积
+        slopes = [(ys[i + 1] - ys[i]) / (xs[i + 1] - xs[i]) for i in range(count - 1)]
+        prefix = [Decimal(0)]
+        for i in range(count - 1):
+            prefix.append(prefix[-1] + (xs[i + 1] - xs[i]) * (ys[i] + ys[i + 1]) / 2)
+
+        def segment_of(x: Decimal) -> int:
+            # x 所在的插值段；测点上取右侧段（连续，取值不变），末端归入最后一段
+            return min(max(bisect_right(xs, x) - 1, 0), count - 2)
+
+        def value_at(x: Decimal) -> Decimal:
+            i = segment_of(x)
+            return ys[i] + slopes[i] * (x - xs[i])
+
+        def area_to(x: Decimal) -> Decimal:
+            i = segment_of(x)
+            dx = x - xs[i]
+            return prefix[i] + dx * ys[i] + slopes[i] * dx * dx / 2
+
+        limit = xs[-1] - w  # 起点域右端
+        # 切分点：测点里程 x_i 与其减去窗长的位置 x_i − w（落在起点域内的部分）
+        cuts = {Decimal(0), limit}
+        for x in xs:
+            if 0 < x < limit:
+                cuts.add(x)
+            shifted = x - w
+            if 0 < shifted < limit:
+                cuts.add(shifted)
+        ordered = sorted(cuts)
+
+        candidates = list(ordered)
+        for a, b in zip(ordered, ordered[1:]):
+            # 开区间 (a, b) 内窗口两端各自落在固定的插值段上，取中点定位段号
+            mid = (a + b) / 2
+            i = segment_of(mid)
+            j = segment_of(mid + w)
+            left_slope = slopes[i]
+            right_slope = slopes[j]
+            if left_slope == right_slope:
+                # 两端插值之差恒定：区间上平均值单调或不变，最值必在端点
+                continue
+            # 内部驻点：f(s) == f(s+w) 的唯一解
+            stationary = (
+                ys[j] - ys[i] + right_slope * (w - xs[j]) + left_slope * xs[i]
+            ) / (left_slope - right_slope)
+            if a < stationary < b:
+                candidates.append(stationary)
+
+        best_start = Decimal(0)
+        best_area = Decimal(0)
+        best_average: Decimal | None = None
+        # 起点升序扫描，仅在严格更小时替换：并列时保留起点最小者
+        for start in sorted(candidates):
+            area = area_to(start + w) - area_to(start)
+            average = area / w
+            if best_average is None or average < best_average:
+                best_start = start
+                best_area = area
+                best_average = average
+
+        return LowestWindow(
+            start=best_start,
+            end=best_start + w,
+            start_value=value_at(best_start),
+            end_value=value_at(best_start + w),
+            area=best_area,
+            average=best_average,
+        )

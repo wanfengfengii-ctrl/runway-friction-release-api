@@ -17,6 +17,7 @@ import urllib.request
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 ENDPOINT = f"{BASE_URL}/api/v1/friction/assess"
 CALIBRATED_ENDPOINT = f"{BASE_URL}/api/v1/friction/calibrated-assess"
+PROFILE_ENDPOINT = f"{BASE_URL}/api/v1/friction/profile-assess"
 
 _failures: list[str] = []
 
@@ -355,13 +356,193 @@ def main() -> int:
     for name, raw, field in calibrated_rejected:
         status, data = request_json(raw, 422, CALIBRATED_ENDPOINT)
         ok = status == 422 and isinstance(data.get("detail"), list) and bool(data["detail"])
-        check(f"422 拒绝：{name}", ok, f"status={status}, body={str(data)[:160]}")
+        check(f"校准入口 422 拒绝：{name}", ok, f"status={status}, body={str(data)[:160]}")
         if ok:
             locs = [err.get("loc", []) for err in data["detail"]]
             check(f"  └ 错误位置指向 {field}",
                   any(field in loc for loc in locs), str(locs))
             check(f"  └ 无部分判定：{name}",
                   "segments" not in data and "overall_rating" not in data)
+
+    # 13. 连续巡检剖面评估：最低平均窗落在内部驻点，严格优于所有断点候选
+    profile_body = {
+        "runway_id": "18L",
+        "runway_length": 400,
+        "window_length": 180,
+        "points": [
+            {"mileage": mileage, "coefficient": coefficient}
+            for mileage, coefficient in zip(
+                [0, 50, 100, 150, 200, 250, 300, 350, 400],
+                [0.80, 0.65, 0.50, 0.35, 0.20, 0.35, 0.50, 0.65, 0.80],
+            )
+        ],
+    }
+    status, data = request_json(json.dumps(profile_body), 200, PROFILE_ENDPOINT)
+    check("剖面评估返回 200", status == 200, str(status))
+    if status == 200:
+        check("最低窗落在内部驻点（110–290，两端插值 0.47）",
+              data["start_mileage"] == 110
+              and data["end_mileage"] == 290
+              and data["start_friction"] == 0.47
+              and data["end_friction"] == 0.47, str(data))
+        check("窗口面积与平均值", data["area"] == 60.3 and data["average"] == 0.335, str(data))
+        check("平均值判级关注", data["rating"] == "关注", str(data))
+
+        # 与实现无关的参考积分：结果必须严格优于全部断点候选（不能只枚举测点起点）
+        profile_points = [(p["mileage"], p["coefficient"]) for p in profile_body["points"]]
+
+        def reference_average(start):
+            def value_at(x):
+                for (x0, y0), (x1, y1) in zip(profile_points, profile_points[1:]):
+                    if x0 <= x <= x1:
+                        return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+                raise AssertionError("参考积分越界")
+
+            end = start + 180
+            grid = [start] + [x for x, _ in profile_points if start < x < end] + [end]
+            area = sum((b - a) * (value_at(a) + value_at(b)) / 2
+                       for a, b in zip(grid, grid[1:]))
+            return area / 180
+
+        limit = 400 - 180
+        candidates = {0.0, float(limit)}
+        for mileage, _ in profile_points:
+            if 0 < mileage < limit:
+                candidates.add(float(mileage))
+            if 0 < mileage - 180 < limit:
+                candidates.add(float(mileage - 180))
+        check("起点不在任何断点候选上", data["start_mileage"] not in candidates,
+              str(sorted(candidates)))
+        check("结果优于所有断点候选",
+              data["average"] < min(reference_average(s) for s in candidates),
+              f"最优断点 {min(reference_average(s) for s in candidates)}")
+
+    # 14. 对称剖面：所有窗口并列时取最早窗口
+    wave_body = {
+        "runway_id": "18L",
+        "runway_length": 400,
+        "window_length": 200,
+        "points": [
+            {"mileage": mileage, "coefficient": coefficient}
+            for mileage, coefficient in zip(
+                [0, 50, 100, 150, 200, 250, 300, 350, 400],
+                [0.50, 0.40, 0.30, 0.40, 0.50, 0.40, 0.30, 0.40, 0.50],
+            )
+        ],
+    }
+    status, data = request_json(json.dumps(wave_body), 200, PROFILE_ENDPOINT)
+    check("对称剖面并列取最早窗口",
+          status == 200
+          and data["start_mileage"] == 0
+          and data["end_mileage"] == 200
+          and data["average"] == 0.4
+          and data["rating"] == "正常", str(data))
+
+    # 15. 临界均值判级：0.40 正常 / 0.30 关注 / 0.29 关闭；判级按未舍入值
+    def flat_body(coefficient):
+        return {
+            "runway_id": "18L",
+            "runway_length": 300,
+            "window_length": 100,
+            "points": [
+                {"mileage": mileage, "coefficient": coefficient}
+                for mileage in (0, 60, 120, 180, 240, 300)
+            ],
+        }
+
+    for coefficient, expected in ((0.40, "正常"), (0.30, "关注"), (0.29, "关闭")):
+        status, data = request_json(json.dumps(flat_body(coefficient)), 200, PROFILE_ENDPOINT)
+        check(f"临界均值 {coefficient} 判级 {expected}",
+              status == 200 and data["average"] == coefficient and data["rating"] == expected,
+              str(data))
+
+    # 未舍入平均值 0.2999998333…：六位小数输出 0.300000，判级仍为关闭
+    dip_body = {
+        "runway_id": "18L",
+        "runway_length": 3.0001,
+        "window_length": 3,
+        "points": [
+            {"mileage": 0, "coefficient": 0.30},
+            {"mileage": 1, "coefficient": 0.30},
+            {"mileage": 1.00005, "coefficient": 0.29},
+            {"mileage": 1.0001, "coefficient": 0.30},
+            {"mileage": 2, "coefficient": 0.30},
+            {"mileage": 3, "coefficient": 0.30},
+            {"mileage": 3.0001, "coefficient": 0.30},
+        ],
+    }
+    status, data = request_json(json.dumps(dip_body), 200, PROFILE_ENDPOINT)
+    check("未舍入均值判级（输出 0.300000 仍判关闭）",
+          status == 200 and data["average"] == 0.3 and data["rating"] == "关闭", str(data))
+
+    # 16. 剖面评估 422 整份拒绝矩阵
+    profile_rejected = [
+        ("测点不足 6 个", json.dumps({**profile_body, "points": profile_body["points"][:5]}), "points"),
+        ("测点超过 50 个", json.dumps({**profile_body, "points": [
+            {"mileage": i * 8, "coefficient": 0.50} for i in range(50)
+        ] + [{"mileage": 400, "coefficient": 0.50}]}), "points"),
+        ("里程重复", json.dumps({**profile_body, "points": profile_body["points"][:3] + [
+            {"mileage": 100, "coefficient": 0.50}] + profile_body["points"][4:]}), "points"),
+        ("未覆盖零点", json.dumps({**profile_body, "points": [
+            {"mileage": 0.5, "coefficient": 0.80}] + profile_body["points"][1:]}), "points"),
+        ("未覆盖跑道终点", json.dumps({**profile_body, "points": profile_body["points"][:-1] + [
+            {"mileage": 399, "coefficient": 0.80}]}), "points"),
+        ("里程越界", json.dumps({**profile_body, "points": profile_body["points"][:-1] + [
+            {"mileage": 400.01, "coefficient": 0.80}]}), "points"),
+        ("窗长等于跑道长度", json.dumps({**profile_body, "window_length": 400}), "window_length"),
+        ("窗长为零", json.dumps({**profile_body, "window_length": 0}), "window_length"),
+        ("系数越界", json.dumps({**profile_body, "points": profile_body["points"][:2] + [
+            {"mileage": 100, "coefficient": 1.01}] + profile_body["points"][3:]}), "coefficient"),
+        ("系数超两位小数", json.dumps({**profile_body, "points": profile_body["points"][:2] + [
+            {"mileage": 100, "coefficient": 0.123}] + profile_body["points"][3:]}), "coefficient"),
+        ("系数非有限值",
+         '{"runway_id":"18L","runway_length":400,"window_length":180,"points":['
+         '{"mileage":0,"coefficient":0.80},{"mileage":50,"coefficient":0.65},'
+         '{"mileage":100,"coefficient":NaN},{"mileage":150,"coefficient":0.35},'
+         '{"mileage":200,"coefficient":0.20},{"mileage":250,"coefficient":0.35},'
+         '{"mileage":300,"coefficient":0.50},{"mileage":350,"coefficient":0.65},'
+         '{"mileage":400,"coefficient":0.80}]}', "points"),
+        ("超大整数系数", json.dumps({**profile_body, "points": profile_body["points"][:2] + [
+            {"mileage": 100, "coefficient": 10 ** 400}] + profile_body["points"][3:]}), "coefficient"),
+    ]
+    for name, raw, field in profile_rejected:
+        status, data = request_json(raw, 422, PROFILE_ENDPOINT)
+        ok = status == 422 and isinstance(data.get("detail"), list) and bool(data["detail"])
+        check(f"剖面评估 422 拒绝：{name}", ok, f"status={status}, body={str(data)[:160]}")
+        if ok:
+            locs = [err.get("loc", []) for err in data["detail"]]
+            check(f"  └ 错误位置指向 {field}", any(field in loc for loc in locs), str(locs))
+            check(f"  └ 无部分判定：{name}", "average" not in data and "rating" not in data)
+
+    # 17. 两个既有评估入口响应不变
+    status, data = request_json(json.dumps({
+        "runway_id": "18L",
+        "front": [0.52, 0.31, 0.60],
+        "middle": [0.40, 0.45, 0.90],
+        "rear": [0.70, 0.80, 0.29],
+    }), 200, ENDPOINT)
+    check("既有评估入口响应不变",
+          status == 200
+          and [s["median"] for s in data["segments"]] == [0.52, 0.45, 0.70]
+          and data["overall_rating"] == "正常", str(data))
+    status, data = request_json(json.dumps({
+        "runway_id": "18L",
+        "anchors": [
+            {"reading": 0.10, "true_value": 0.50},
+            {"reading": 0.20, "true_value": 0.40},
+            {"reading": 0.30, "true_value": 0.20},
+            {"reading": 0.40, "true_value": 0.10},
+            {"reading": 0.50, "true_value": 0.45},
+            {"reading": 0.60, "true_value": 0.35},
+        ],
+        "front": [0.10, 0.50, 0.20],
+        "middle": [0.50, 0.60, 0.50],
+        "rear": [0.40, 0.40, 0.40],
+    }), 200, CALIBRATED_ENDPOINT)
+    check("既有校准入口响应不变",
+          status == 200
+          and [a["block"] for a in data["anchors"]] == [0, 0, 0, 0, 1, 1]
+          and data["overall_rating"] == "关注", str(data))
 
     print()
     if _failures:

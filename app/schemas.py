@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from decimal import Decimal
 from enum import Enum
 from typing import Any
 
@@ -274,3 +275,148 @@ class CalibratedFrictionAssessment(BaseModel):
     worst_segments: list[str] = Field(
         ..., description="达到整跑道最差等级的段名（前/中/后中的一个或多个）"
     )
+
+
+# ---------- 连续巡检剖面评估 ----------
+
+# 剖面测点数量约束
+MIN_PROFILE_POINTS = 6
+MAX_PROFILE_POINTS = 50
+
+
+def _check_finite_decimal(item: Any, label: str) -> Decimal:
+    """通用数值校验：数字、有限，统一转为 Decimal。
+
+    剖面评估请求的 JSON 小数已按 Decimal 保真解析；直接构造模型时传入的
+    int / float 也在此精确转换（float 经最短十进制表示还原）。
+    """
+    # bool 是 int 的子类，须在数值判断前排除
+    if isinstance(item, bool) or not isinstance(item, (int, float, Decimal)):
+        raise ValueError(f"{label}必须是数字")
+    if isinstance(item, Decimal):
+        value = item
+    elif isinstance(item, int):
+        value = Decimal(item)
+    else:
+        value = Decimal(str(item))
+    if not value.is_finite():
+        raise ValueError(f"{label}必须为有限数")
+    return value
+
+
+def _check_profile_coefficient(item: Any) -> Decimal:
+    """测点摩阻系数校验：数字、有限、0.00–1.00、至多两位小数，返回 Decimal。"""
+    coefficient = _check_finite_decimal(item, "摩阻系数")
+    if not (Decimal("0.00") <= coefficient <= Decimal("1.00")):
+        raise ValueError(
+            f"摩阻系数必须介于 {MIN_VALUE:.2f} 与 {MAX_VALUE:.2f} 之间"
+        )
+    # 保留至多两位小数：舍到两位后应与原值相等（数值比较，0.100 视为 0.10）
+    if coefficient != coefficient.quantize(Decimal("0.01")):
+        raise ValueError("摩阻系数至多保留两位小数")
+    return coefficient
+
+
+class ProfilePoint(BaseModel):
+    """一个里程—摩阻测点：里程自跑道起点起算，系数 0.00–1.00 至多两位小数。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mileage: Decimal = Field(..., description="测点里程（≥ 0，与跑道长度同单位）")
+    coefficient: Decimal = Field(..., description="摩阻系数（0.00–1.00，至多两位小数）")
+
+    @field_validator("mileage", mode="before")
+    @classmethod
+    def _mileage_valid(cls, value: Any) -> Decimal:
+        mileage = _check_finite_decimal(value, "测点里程")
+        if mileage < 0:
+            raise ValueError("测点里程不得为负")
+        return mileage
+
+    @field_validator("coefficient", mode="before")
+    @classmethod
+    def _coefficient_valid(cls, value: Any) -> Decimal:
+        return _check_profile_coefficient(value)
+
+
+class ProfileFrictionInput(BaseModel):
+    """连续巡检剖面评估请求：跑道编号、跑道长度、固定检查窗长与里程—摩阻测点。
+
+    测点 6–50 个，须按里程严格递增（不得重复或倒退），并恰好覆盖零点（首点
+    里程为 0）与跑道终点（末点里程等于跑道长度）；窗长大于 0 且小于跑道长度。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    runway_id: str = Field(..., min_length=1, max_length=16, description="跑道编号")
+    runway_length: Decimal = Field(..., description="跑道长度（与测点里程同单位，大于 0）")
+    window_length: Decimal = Field(..., description="固定检查窗长度（大于 0 且小于跑道长度）")
+    points: list[ProfilePoint] = Field(
+        ...,
+        min_length=MIN_PROFILE_POINTS,
+        max_length=MAX_PROFILE_POINTS,
+        description=f"里程—摩阻测点（{MIN_PROFILE_POINTS}–{MAX_PROFILE_POINTS} 个，里程严格递增并覆盖跑道全程）",
+    )
+
+    @field_validator("runway_id")
+    @classmethod
+    def _runway_id_not_blank(cls, value: str) -> str:
+        return _check_runway_id(value)
+
+    @field_validator("runway_length", mode="before")
+    @classmethod
+    def _runway_length_valid(cls, value: Any) -> Decimal:
+        length = _check_finite_decimal(value, "跑道长度")
+        if length <= 0:
+            raise ValueError("跑道长度必须大于 0")
+        return length
+
+    @field_validator("window_length", mode="before")
+    @classmethod
+    def _window_length_valid(cls, value: Any, info: Any) -> Decimal:
+        window = _check_finite_decimal(value, "窗长")
+        if window <= 0:
+            raise ValueError("窗长必须大于 0")
+        # runway_length 声明在前且已校验；若其本身非法（不在 info.data 中）则跳过
+        # 交叉检查，跑道长度的报错已足以让整份请求以 422 拒绝
+        runway_length = info.data.get("runway_length")
+        if runway_length is not None and window >= runway_length:
+            raise ValueError("窗长必须小于跑道长度")
+        return window
+
+    @field_validator("points")
+    @classmethod
+    def _points_valid(
+        cls, points: list[ProfilePoint], info: Any
+    ) -> list[ProfilePoint]:
+        mileages = [point.mileage for point in points]
+        for previous, current in zip(mileages, mileages[1:]):
+            if current <= previous:
+                raise ValueError("测点里程必须严格递增，存在重复或倒退里程")
+        # runway_length 非法时跳过越界 / 覆盖检查（其报错已足以 422 整份拒绝）
+        runway_length = info.data.get("runway_length")
+        if runway_length is not None:
+            out_of_range = sorted({m for m in mileages if m > runway_length})
+            if out_of_range:
+                raise ValueError(
+                    "测点里程不得超出跑道长度，越界里程："
+                    + ", ".join(str(m) for m in out_of_range)
+                )
+            if mileages[0] != 0:
+                raise ValueError("首个测点里程必须为 0（测点须恰好覆盖零点）")
+            if mileages[-1] != runway_length:
+                raise ValueError("末个测点里程必须等于跑道长度（测点须恰好覆盖跑道终点）")
+        return points
+
+
+class ProfileFrictionAssessment(BaseModel):
+    """连续巡检剖面评估结果：平均摩阻最低的定长检查窗（数值保留六位小数）。"""
+
+    runway_id: str
+    start_mileage: float = Field(..., description="窗口起点里程")
+    end_mileage: float = Field(..., description="窗口止点里程")
+    start_friction: float = Field(..., description="窗口起点插值摩阻")
+    end_friction: float = Field(..., description="窗口止点插值摩阻")
+    area: float = Field(..., description="窗口积分面积")
+    average: float = Field(..., description="窗口平均摩阻（判级按未舍入值）")
+    rating: Rating = Field(..., description="窗口平均值判级（沿用 0.40 / 0.30 边界）")
