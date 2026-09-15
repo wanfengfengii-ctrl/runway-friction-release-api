@@ -10,8 +10,13 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 
-from app.schemas import FrictionAssessment, FrictionInput
-from app.service import assess
+from app.schemas import (
+    CalibratedFrictionAssessment,
+    CalibratedFrictionInput,
+    FrictionAssessment,
+    FrictionInput,
+)
+from app.service import assess, assess_calibrated
 
 DESCRIPTION = """雨后跑道摩阻评估 API。
 
@@ -20,6 +25,11 @@ DESCRIPTION = """雨后跑道摩阻评估 API。
   一个最低值与最高值，取剩余三值的中位数，并随段结果返回剔除值与参与判定的三值。
 - 服务取每段中位数判级：≥0.40 正常，0.30–<0.40 关注，<0.30 关闭。
 - 整跑道采用三段中的最差等级。
+- 仪器存在系统性漂移时，可改走 `/api/v1/friction/calibrated-assess`：随三段原始读数
+  一并提交 4–12 个校准锚点（仪器读数 + 真值，读数唯一），服务按读数升序执行等权
+  相邻违序合并（下降块反复向前合并，块拟合值取全部成员真值的算术均值，直至所有块
+  单调不降），每个段样本以精确对应的锚点最终所属块的拟合值校准后进入同一套判级；
+  响应逐锚点返回最终块归属与拟合值，逐段并列原始读数与校正值。
 - 任何输入不合法均以 422 整份拒绝，不返回部分判定。
 """
 
@@ -102,3 +112,20 @@ async def assess_friction(request: Request) -> FrictionAssessment:
     except ValidationError as exc:
         raise RequestValidationError(_sanitize_errors(exc.errors()), body=payload) from exc
     return assess(data)
+
+
+@app.post(
+    "/api/v1/friction/calibrated-assess",
+    response_model=CalibratedFrictionAssessment,
+    response_model_exclude_none=True,
+    tags=["摩阻评估"],
+    summary="提交校准锚点与三段原始读数，按等权相邻违序合并校准后判级",
+)
+async def assess_friction_calibrated(request: Request) -> CalibratedFrictionAssessment:
+    raw = await request.body()
+    payload = _parse_strict_json(raw)
+    try:
+        data = CalibratedFrictionInput.model_validate(payload)
+    except ValidationError as exc:
+        raise RequestValidationError(_sanitize_errors(exc.errors()), body=payload) from exc
+    return assess_calibrated(data)

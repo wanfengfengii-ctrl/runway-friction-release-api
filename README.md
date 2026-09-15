@@ -4,9 +4,13 @@
 服务取每段中位数分段判级，并按三段中的最差等级给出整跑道结论。
 雨后复测受局部积水或仪器瞬时跳变影响时，可改用**五点稳健采样**（每段 5 个系数，
 剔除一个最低值与一个最高值后取剩余三值的中位数），从同一入口取得整跑道结论。
+连续作业前发现同一测量仪存在**系统性漂移**时，可改走**校准评估入口**：随三段
+原始读数一并提交 4–12 个校准锚点（仪器读数 + 真值），服务按读数升序执行等权
+相邻违序合并，每个段样本以精确对应锚点最终所属块的拟合值校准后进入同一套判级。
 
 - **运行时**：Python 3.12 · FastAPI · Pydantic v2
-- **测试**：pytest（59 项，覆盖输入校验、分段判级、五点稳健采样、结果组装与 422 整份拒绝）
+- **测试**：pytest（89 项，覆盖输入校验、分段判级、五点稳健采样、等权相邻违序合并、
+  校准评估、结果组装与 422 整份拒绝）
 - **部署**：Docker Compose（默认仅运行 API；宿主端口可用 `API_PORT` 覆盖）
 
 ## 判级规则
@@ -35,6 +39,102 @@
 五点模式下每个段结果额外返回 `excluded_values`（被剔除的最低/最高值）与
 `used_values`（实际参与判定的三值），`raw_values` 仍回显原始五值；
 未传 `sampling` 的三值请求响应结构保持不变（不含这两个字段）。
+
+## 仪器漂移校准评估（`/api/v1/friction/calibrated-assess`）
+
+连续作业前发现同一测量仪存在系统性漂移时，维护人员可随三段原始读数一并提交
+4–12 个校准锚点。每个锚点由**仪器读数** `reading` 与**真值** `true_value`
+组成（均为 0.00–1.00、至多两位小数；读数在同一请求内必须唯一）。校准算法为
+**等权相邻违序合并**（Pool Adjacent Violators Algorithm）：
+
+1. 锚点按仪器读数升序排列，每个锚点起初自成一块；
+2. 凡相邻两块出现下降（前块拟合值严格大于后块拟合值）即合并为一块，
+   下降块须反复向前合并，直至所有块单调不降；
+3. 块拟合值取全部成员真值的算术均值（等权），合并不丢失任何块成员。
+
+三段样本的个数规则与原入口一致（三点 3 个、五点 5 个，`sampling` 语义相同），
+且**每个段样本必须精确等于某一锚点的仪器读数**；校准时以该锚点最终所属块的
+拟合值替换原读数，随后进入与原入口相同的三点中位数 / 五点去极值、阈值判级与
+最差段组装。块拟合值恰为 0.30 或 0.40 时沿用现有边界等级（0.30→关注、0.40→正常）。
+
+响应在原评估结构基础上扩展：
+
+- `anchors`：逐锚点的校准结果（按读数升序），含 `reading`、`true_value`、
+  最终块编号 `block`（从 0 起编）与所属块拟合值 `fitted_value`；
+- `segments`：每段并列原始读数 `raw_values` 与校正值 `calibrated_values`，
+  以及基于校正值的 `median`、`rating`（五点模式另含 `excluded_values` /
+  `used_values`，同样基于校正值）；
+- `overall_rating` 与 `worst_segments` 语义不变。
+
+锚点数量（4–12）、有限数、0.00–1.00 范围、两位精度、读数唯一性及段样本引用
+错误均以 422 整份拒绝，错误位置 `loc` 指向对应请求字段（`anchors` 或相应段名）。
+
+### 校准评估请求示例（级联合并）
+
+```bash
+curl -X POST http://localhost:8000/api/v1/friction/calibrated-assess \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "runway_id": "18L",
+    "anchors": [
+      {"reading": 0.10, "true_value": 0.50},
+      {"reading": 0.20, "true_value": 0.40},
+      {"reading": 0.30, "true_value": 0.20},
+      {"reading": 0.40, "true_value": 0.10},
+      {"reading": 0.50, "true_value": 0.45},
+      {"reading": 0.60, "true_value": 0.35}
+    ],
+    "front":  [0.10, 0.50, 0.20],
+    "middle": [0.50, 0.60, 0.50],
+    "rear":   [0.40, 0.40, 0.40]
+  }'
+```
+
+真值沿读数升序为 0.50 / 0.40 / 0.20 / 0.10，每个新块都触发向前合并，最终四个
+锚点同属块 0（拟合值 1.20/4，恰为 0.30，块成员不丢失）；0.45 / 0.35 并成块 1
+（拟合值恰为 0.40）。响应：
+
+```json
+{
+  "runway_id": "18L",
+  "anchors": [
+    {"reading": 0.10, "true_value": 0.50, "block": 0, "fitted_value": 0.30},
+    {"reading": 0.20, "true_value": 0.40, "block": 0, "fitted_value": 0.30},
+    {"reading": 0.30, "true_value": 0.20, "block": 0, "fitted_value": 0.30},
+    {"reading": 0.40, "true_value": 0.10, "block": 0, "fitted_value": 0.30},
+    {"reading": 0.50, "true_value": 0.45, "block": 1, "fitted_value": 0.40},
+    {"reading": 0.60, "true_value": 0.35, "block": 1, "fitted_value": 0.40}
+  ],
+  "segments": [
+    {
+      "segment": "front",
+      "label": "前段",
+      "raw_values": [0.10, 0.50, 0.20],
+      "calibrated_values": [0.30, 0.40, 0.30],
+      "median": 0.30,
+      "rating": "关注"
+    },
+    {
+      "segment": "middle",
+      "label": "中段",
+      "raw_values": [0.50, 0.60, 0.50],
+      "calibrated_values": [0.40, 0.40, 0.40],
+      "median": 0.40,
+      "rating": "正常"
+    },
+    {
+      "segment": "rear",
+      "label": "后段",
+      "raw_values": [0.40, 0.40, 0.40],
+      "calibrated_values": [0.30, 0.30, 0.30],
+      "median": 0.30,
+      "rating": "关注"
+    }
+  ],
+  "overall_rating": "关注",
+  "worst_segments": ["front", "rear"]
+}
+```
 
 ## 输入约束（任一不满足均返回 422，不返回部分判定）
 
@@ -191,6 +291,14 @@ HTTP/2 422
 缺段、重复段名（JSON 中重复键）、数量不符（含五点模式下非 5 值的段）、越界、
 非有限数等情形同以 422 整份拒绝，错误位置 `loc` 指向对应段。
 
+### `POST /api/v1/friction/calibrated-assess`
+
+仪器漂移校准评估入口，详见上文「仪器漂移校准评估」一节。请求体在原入口字段
+（`runway_id`、可选 `sampling`、`front` / `middle` / `rear` 三段原始读数）
+之上增加 `anchors`（4–12 个 `{reading, true_value}` 校准锚点，读数唯一）；
+响应逐锚点返回最终块归属与拟合值，逐段并列原始读数与校正值，判级规则与
+最差段组装同原入口。原评估入口的三点、五点结构与结果保持不变。
+
 ### `GET /health`
 
 返回 `{"status": "ok"}`，供容器健康检查与探活使用。
@@ -223,7 +331,8 @@ docker compose down
 
 仓库内置零第三方依赖的验收脚本 `scripts/acceptance.py`，会对运行中的 API
 执行健康检查、合法判级、临界值归属、最差段接管、五点稳健采样（抗单个异常
-高/低值、相同极值只剔一个、旧请求结构不变）及完整 422 拒绝矩阵，
+高/低值、相同极值只剔一个、旧请求结构不变）、仪器漂移校准（级联合并、块成员
+不丢失、拟合值边界落级、逐段原值与校正值）及完整 422 拒绝矩阵，
 输出逐项 PASS/FAIL 并以退出码表示结论。在 Compose 中它是**一次性**服务
 （`docker compose run --rm`，跑完即退出并自动删除容器）：
 
@@ -246,9 +355,9 @@ BASE_URL=http://127.0.0.1:8000 python3 scripts/acceptance.py
 ```
 app/
   __init__.py
-  friction.py    # 领域规则：三点/五点中位数、阈值判级、最差等级（纯函数）
-  schemas.py     # Pydantic 请求/响应模型与输入校验
-  service.py     # 结果组装：段顺序、整体等级、最差段
+  friction.py    # 领域规则：三点/五点中位数、阈值判级、最差等级、等权相邻违序合并（纯函数）
+  schemas.py     # Pydantic 请求/响应模型与输入校验（含校准锚点与样本引用校验）
+  service.py     # 结果组装：段顺序、整体等级、最差段、校准评估编排
   main.py        # FastAPI 应用、严格 JSON 解析（含重复键检测）、422
 scripts/
   acceptance.py  # 一次性端到端验收脚本（仅标准库）
@@ -256,6 +365,7 @@ tests/
   test_friction.py
   test_service.py
   test_api.py
+  test_calibrated.py
 Dockerfile
 docker-compose.yml
 requirements.txt

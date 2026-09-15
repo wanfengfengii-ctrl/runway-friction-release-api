@@ -16,6 +16,7 @@ import urllib.request
 
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 ENDPOINT = f"{BASE_URL}/api/v1/friction/assess"
+CALIBRATED_ENDPOINT = f"{BASE_URL}/api/v1/friction/calibrated-assess"
 
 _failures: list[str] = []
 
@@ -27,10 +28,10 @@ def check(name: str, condition: bool, detail: str = "") -> None:
         _failures.append(name)
 
 
-def request_json(raw: str | bytes, expect_status: int):
+def request_json(raw: str | bytes, expect_status: int, endpoint: str = ENDPOINT):
     body = raw if isinstance(raw, bytes) else raw.encode("utf-8")
     req = urllib.request.Request(
-        ENDPOINT,
+        endpoint,
         data=body,
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -263,6 +264,92 @@ def main() -> int:
             locs = [err.get("loc", []) for err in data["detail"]]
             check(f"  └ 错误位置指向 {segment}",
                   any(segment in loc for loc in locs), str(locs))
+            check(f"  └ 无部分判定：{name}",
+                  "segments" not in data and "overall_rating" not in data)
+
+    # 11. 仪器漂移校准：级联合并样例（真值 0.50/0.40/0.20/0.10 逐级并入一块，
+    #     拟合值恰为 0.30；0.45/0.35 并成第二块，拟合值恰为 0.40）
+    cascade_anchors = [
+        {"reading": 0.10, "true_value": 0.50},
+        {"reading": 0.20, "true_value": 0.40},
+        {"reading": 0.30, "true_value": 0.20},
+        {"reading": 0.40, "true_value": 0.10},
+        {"reading": 0.50, "true_value": 0.45},
+        {"reading": 0.60, "true_value": 0.35},
+    ]
+    body = {
+        "runway_id": "18L",
+        "anchors": cascade_anchors,
+        "front": [0.10, 0.50, 0.20],
+        "middle": [0.50, 0.60, 0.50],
+        "rear": [0.40, 0.40, 0.40],
+    }
+    status, data = request_json(json.dumps(body), 200, CALIBRATED_ENDPOINT)
+    check("校准评估返回 200", status == 200, str(status))
+    if status == 200:
+        anchors = data["anchors"]
+        check("锚点按读数升序返回",
+              [a["reading"] for a in anchors] == [0.10, 0.20, 0.30, 0.40, 0.50, 0.60],
+              str(anchors))
+        check("级联合并后块归属正确",
+              [a["block"] for a in anchors] == [0, 0, 0, 0, 1, 1],
+              str([a["block"] for a in anchors]))
+        check("块成员不丢失（块0含4个、块1含2个锚点）",
+              sum(1 for a in anchors if a["block"] == 0) == 4
+              and sum(1 for a in anchors if a["block"] == 1) == 2, str(anchors))
+        check("块拟合值为成员真值算术均值（恰为 0.30 / 0.40）",
+              [a["fitted_value"] for a in anchors] == [0.30] * 4 + [0.40] * 2,
+              str([a["fitted_value"] for a in anchors]))
+        by_name = {s["segment"]: s for s in data["segments"]}
+        front, middle = by_name["front"], by_name["middle"]
+        check("段结果并列原值与校正值",
+              front["raw_values"] == [0.10, 0.50, 0.20]
+              and front["calibrated_values"] == [0.30, 0.40, 0.30], str(front))
+        check("拟合值 0.30 落级关注（沿用现有边界）",
+              front["median"] == 0.30 and front["rating"] == "关注", str(front))
+        check("拟合值 0.40 落级正常（沿用现有边界）",
+              middle["median"] == 0.40 and middle["rating"] == "正常", str(middle))
+        check("校准后最差段接管结论",
+              data["overall_rating"] == "关注"
+              and data["worst_segments"] == ["front", "rear"],
+              str(data.get("worst_segments")))
+
+    # 12. 校准评估 422 整份拒绝：锚点数量、重复读数、样本引用、精度、非有限数
+    calibrated_rejected: list[tuple[str, str | bytes, str]] = [
+        ("锚点不足 4 个", json.dumps({"runway_id": "18", "anchors": cascade_anchors[:3],
+                                      "front": [0.10, 0.20, 0.30], "middle": [0.10, 0.20, 0.30],
+                                      "rear": [0.10, 0.20, 0.30]}), "anchors"),
+        ("锚点读数重复", json.dumps({"runway_id": "18", "anchors": cascade_anchors[:3] + [
+            {"reading": 0.30, "true_value": 0.60}],
+            "front": [0.10, 0.20, 0.30], "middle": [0.10, 0.20, 0.30],
+            "rear": [0.10, 0.20, 0.30]}), "anchors"),
+        ("锚点真值精度超限", json.dumps({"runway_id": "18", "anchors": cascade_anchors[:3] + [
+            {"reading": 0.70, "true_value": 0.505}],
+            "front": [0.10, 0.20, 0.30], "middle": [0.10, 0.20, 0.30],
+            "rear": [0.10, 0.20, 0.30]}), "anchors"),
+        ("锚点读数越界", json.dumps({"runway_id": "18", "anchors": cascade_anchors[:3] + [
+            {"reading": 1.01, "true_value": 0.50}],
+            "front": [0.10, 0.20, 0.30], "middle": [0.10, 0.20, 0.30],
+            "rear": [0.10, 0.20, 0.30]}), "anchors"),
+        ("段样本无对应锚点", json.dumps({"runway_id": "18", "anchors": cascade_anchors,
+                                         "front": [0.10, 0.20, 0.35],
+                                         "middle": [0.10, 0.20, 0.30],
+                                         "rear": [0.10, 0.20, 0.30]}), "front"),
+        ("锚点非有限值 NaN",
+         b'{"runway_id":"18","anchors":[{"reading":0.10,"true_value":0.50},'
+         b'{"reading":0.20,"true_value":0.40},{"reading":0.30,"true_value":0.20},'
+         b'{"reading":0.40,"true_value":NaN}],'
+         b'"front":[0.10,0.20,0.30],"middle":[0.10,0.20,0.30],"rear":[0.10,0.20,0.30]}',
+         "anchors"),
+    ]
+    for name, raw, field in calibrated_rejected:
+        status, data = request_json(raw, 422, CALIBRATED_ENDPOINT)
+        ok = status == 422 and isinstance(data.get("detail"), list) and bool(data["detail"])
+        check(f"422 拒绝：{name}", ok, f"status={status}, body={str(data)[:160]}")
+        if ok:
+            locs = [err.get("loc", []) for err in data["detail"]]
+            check(f"  └ 错误位置指向 {field}",
+                  any(field in loc for loc in locs), str(locs))
             check(f"  └ 无部分判定：{name}",
                   "segments" not in data and "overall_rating" not in data)
 
